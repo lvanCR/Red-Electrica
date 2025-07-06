@@ -115,19 +115,95 @@ def my_kmeans(points: np.ndarray, k: int, max_iters: int = 100) -> np.ndarray:
 
     return centroids
 
+def optimal_assignment(
+    nodes_to_connect: t.List[t.Any],
+    candidate_pool: t.List[t.Any],
+    subgraph: nx.Graph,
+    failed_nodes: t.Set[t.Any] = None
+) -> t.List[t.Tuple[t.Any, t.Any]]:
+    """
+    Encuentra la asignación óptima entre nodos a conectar y candidatos sanos
+    que minimiza el costo total de conexiones.
+    Excluye explícitamente nodos fallidos de la consideración.
+    
+    Args:
+        nodes_to_connect: Lista de nodos que necesitan conexión
+        candidate_pool: Lista de nodos candidatos sanos
+        subgraph: Grafo con las posiciones de los nodos
+        failed_nodes: Nodos que han fallado y deben ser excluidos
+    
+    Returns:
+        Lista de tuplas (nodo_aislado, nodo_sano) con asignación óptima
+    """
+    if not nodes_to_connect or not candidate_pool:
+        return []
+    
+    # Filtrar explícitamente nodos fallidos del pool de candidatos
+    if failed_nodes:
+        candidate_pool = [node for node in candidate_pool if node not in failed_nodes]
+    
+    if not candidate_pool:
+        return []
+    
+    # Crear matriz de distancias entre todos los pares
+    connections = []
+    for iso_node in nodes_to_connect:
+        iso_pos = np.array(subgraph.nodes[iso_node]['pos'])
+        for cand_node in candidate_pool:
+            cand_pos = np.array(subgraph.nodes[cand_node]['pos'])
+            distance = np.linalg.norm(iso_pos - cand_pos)
+            connections.append((distance, iso_node, cand_node))
+    
+    # Ordenar por distancia (menor costo primero)
+    connections.sort(key=lambda x: x[0])
+    
+    # Algoritmo greedy óptimo para asignación
+    assigned_isolated = set()
+    assigned_candidates = set()
+    result = []
+    
+    for distance, iso_node, cand_node in connections:
+        if iso_node not in assigned_isolated and cand_node not in assigned_candidates:
+            result.append((iso_node, cand_node))
+            assigned_isolated.add(iso_node)
+            assigned_candidates.add(cand_node)
+            
+            # Si ya asignamos todos los nodos aislados, terminar
+            if len(assigned_isolated) == len(nodes_to_connect):
+                break
+    
+    return result
+
 def find_contingency_solution(
     subgraph: nx.Graph,
     nodes_df: pd.DataFrame,
     isolated_nodes: t.List[t.Any],
-    healthy_nodes: t.Set[t.Any]
+    healthy_nodes: t.Set[t.Any],
+    failed_nodes: t.Set[t.Any] = None
 ) -> t.Tuple[t.List[t.Tuple], t.Set[t.Tuple]]:
     """
-    Orquesta la lógica para encontrar una solución de contingencia, usando my_kmeans.
+    Orquesta la lógica para encontrar una solución de contingencia, usando my_kmeans
+    y asignación óptima para minimizar costos totales de conexión.
+    Excluye explícitamente los nodos fallidos de cualquier consideración de conexión.
+    
+    Args:
+        subgraph: Grafo de la red
+        nodes_df: DataFrame con información de nodos
+        isolated_nodes: Nodos que se aislaron debido a la falla
+        healthy_nodes: Nodos que permanecen conectados y funcionales
+        failed_nodes: Nodos que fallaron intencionalmente (deben ser excluidos)
     """
     suggested_connections = []
     re_energized_edges = set()
 
     if not healthy_nodes or not isolated_nodes:
+        return suggested_connections, re_energized_edges
+
+    # Asegurar que los nodos fallidos nunca aparezcan como candidatos para conexión
+    if failed_nodes:
+        healthy_nodes = healthy_nodes - failed_nodes
+    
+    if not healthy_nodes:
         return suggested_connections, re_energized_edges
 
     isolated_nodes_df = nodes_df[nodes_df['COD'].isin(isolated_nodes)]
@@ -154,13 +230,15 @@ def find_contingency_solution(
         min_idx = np.unravel_index(np.argmin(dist_matrix), dist_matrix.shape)
         nodes_to_connect = [isolated_nodes[min_idx[0]]]
 
-    # Para cada nodo estratégico, encontrar su conexión sana más cercana
-    for node_code in set(nodes_to_connect):
-        node_pos = np.array(subgraph.nodes[node_code]['pos'])
-        distances_to_candidates = np.linalg.norm(candidate_coords - node_pos, axis=1)
-        best_candidate_idx = distances_to_candidates.argmin()
-        best_candidate = candidate_pool[best_candidate_idx]
-        suggested_connections.append((node_code, best_candidate))
+    # Usar asignación óptima para minimizar el costo total de conexiones
+    optimal_connections = optimal_assignment(
+        list(set(nodes_to_connect)),  # Eliminar duplicados
+        candidate_pool,
+        subgraph,
+        failed_nodes
+    )
+    
+    suggested_connections.extend(optimal_connections)
 
     # Las líneas internas se re-energizan en cualquier caso
     isolated_subgraph = subgraph.subgraph(isolated_nodes)

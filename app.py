@@ -225,7 +225,8 @@ elif analysis_mode == 'Análisis de Vulnerabilidad':
                 subgraph,
                 nodes_df,
                 isolated_nodes,
-                healthy_nodes
+                healthy_nodes,
+                st.session_state.failed_nodes
             )
             st.session_state.suggested_connections = suggested_connections
             st.session_state.re_energized_edges = re_energized_edges
