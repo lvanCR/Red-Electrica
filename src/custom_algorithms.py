@@ -118,21 +118,31 @@ def my_kmeans(points: np.ndarray, k: int, max_iters: int = 100) -> np.ndarray:
 def optimal_assignment(
     nodes_to_connect: t.List[t.Any],
     candidate_pool: t.List[t.Any],
-    subgraph: nx.Graph
+    subgraph: nx.Graph,
+    failed_nodes: t.Set[t.Any] = None
 ) -> t.List[t.Tuple[t.Any, t.Any]]:
     """
     Encuentra la asignación óptima entre nodos a conectar y candidatos sanos
     que minimiza el costo total de conexiones.
+    Excluye explícitamente nodos fallidos de la consideración.
     
     Args:
         nodes_to_connect: Lista de nodos que necesitan conexión
         candidate_pool: Lista de nodos candidatos sanos
         subgraph: Grafo con las posiciones de los nodos
+        failed_nodes: Nodos que han fallado y deben ser excluidos
     
     Returns:
         Lista de tuplas (nodo_aislado, nodo_sano) con asignación óptima
     """
     if not nodes_to_connect or not candidate_pool:
+        return []
+    
+    # Filtrar explícitamente nodos fallidos del pool de candidatos
+    if failed_nodes:
+        candidate_pool = [node for node in candidate_pool if node not in failed_nodes]
+    
+    if not candidate_pool:
         return []
     
     # Crear matriz de distancias entre todos los pares
@@ -168,16 +178,32 @@ def find_contingency_solution(
     subgraph: nx.Graph,
     nodes_df: pd.DataFrame,
     isolated_nodes: t.List[t.Any],
-    healthy_nodes: t.Set[t.Any]
+    healthy_nodes: t.Set[t.Any],
+    failed_nodes: t.Set[t.Any] = None
 ) -> t.Tuple[t.List[t.Tuple], t.Set[t.Tuple]]:
     """
     Orquesta la lógica para encontrar una solución de contingencia, usando my_kmeans
     y asignación óptima para minimizar costos totales de conexión.
+    Excluye explícitamente los nodos fallidos de cualquier consideración de conexión.
+    
+    Args:
+        subgraph: Grafo de la red
+        nodes_df: DataFrame con información de nodos
+        isolated_nodes: Nodos que se aislaron debido a la falla
+        healthy_nodes: Nodos que permanecen conectados y funcionales
+        failed_nodes: Nodos que fallaron intencionalmente (deben ser excluidos)
     """
     suggested_connections = []
     re_energized_edges = set()
 
     if not healthy_nodes or not isolated_nodes:
+        return suggested_connections, re_energized_edges
+
+    # Asegurar que los nodos fallidos nunca aparezcan como candidatos para conexión
+    if failed_nodes:
+        healthy_nodes = healthy_nodes - failed_nodes
+    
+    if not healthy_nodes:
         return suggested_connections, re_energized_edges
 
     isolated_nodes_df = nodes_df[nodes_df['COD'].isin(isolated_nodes)]
@@ -208,7 +234,8 @@ def find_contingency_solution(
     optimal_connections = optimal_assignment(
         list(set(nodes_to_connect)),  # Eliminar duplicados
         candidate_pool,
-        subgraph
+        subgraph,
+        failed_nodes
     )
     
     suggested_connections.extend(optimal_connections)
