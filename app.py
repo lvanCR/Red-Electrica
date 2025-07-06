@@ -3,9 +3,10 @@ import folium
 from streamlit_folium import st_folium
 import pandas as pd
 import networkx as nx
-from src.graph_generator import create_graph_from_csv
 import numpy as np
 import os
+from src.graph_generator import create_graph_from_csv
+from src.custom_algorithms import my_betweenness_centrality, find_contingency_solution
 
 # --- 1. CONFIGURACIÓN DE LA PÁGINA Y ESTILO ---
 st.set_page_config(
@@ -61,6 +62,9 @@ def reset_analysis_states():
     st.session_state.centrality = None
     st.session_state.failed_nodes = set() # Cambiado a un conjunto para fallas múltiples
     st.session_state.isolated_nodes = set()
+    st.session_state.suggested_connections = []
+    st.session_state.re_energized_edges = set()
+    st.session_state.solution_calculated = False
     st.session_state.last_processed_click_coords = None
 
 # @st.cache_data asegura que los datos se carguen solo una vez, mejorando el rendimiento.
@@ -124,6 +128,12 @@ if 'centrality' not in st.session_state:
 if 'failed_nodes' not in st.session_state: # Cambiado a plural
     st.session_state.failed_nodes = set() # Almacena los nodos en los que se ha simulado una falla
     st.session_state.isolated_nodes = set()
+if 'suggested_connections' not in st.session_state:
+    st.session_state.suggested_connections = []
+if 're_energized_edges' not in st.session_state:
+    st.session_state.re_energized_edges = set()
+if 'solution_calculated' not in st.session_state:
+    st.session_state.solution_calculated = False
 if 'last_processed_click_coords' not in st.session_state:
     st.session_state.last_processed_click_coords = None
 
@@ -159,13 +169,13 @@ if analysis_mode == 'Análisis de Ruta Óptima':
     # Crear una lista de nodos para los selectores
     node_list = sorted(filtered_nodes_df['COD'].tolist())
     
-    start_node = st.sidebar.selectbox("Seleccione Origen:", options=node_list, index=0)
-    end_node = st.sidebar.selectbox("Seleccione Destino:", options=node_list, index=len(node_list)-1)
+    start_node = st.sidebar.selectbox("Seleccione Origen:", options=node_list, index=0 if node_list else -1)
+    end_node = st.sidebar.selectbox("Seleccione Destino:", options=node_list, index=len(node_list)-1 if node_list else -1)
 
     if st.sidebar.button("Calcular Ruta Óptima"):
         try:
             # Se usa el algoritmo de Dijkstra sobre el subgrafo filtrado para encontrar la ruta más corta.
-            path = nx.shortest_path(subgraph, source=start_node, target=end_node, weight='weight')
+            path = nx.shortest_path(subgraph, source=start_node, target=end_node, weight='weight') if start_node and end_node else []
             st.session_state.shortest_path = path
             st.session_state.start_node = start_node
             st.session_state.end_node = end_node
@@ -186,15 +196,43 @@ elif analysis_mode == 'Análisis de Centralidad':
     if st.sidebar.button("Calcular Criticidad de la Red"):
         if len(subgraph.nodes) > 0:
             with st.spinner("Calculando centralidad... Esto puede tardar unos segundos."):
-                # Se usa 'betweenness_centrality' para encontrar los nodos más críticos.
-                centrality = nx.betweenness_centrality(subgraph, weight='weight', normalized=True)
-                st.session_state.centrality = centrality
+                # 1. Usamos nuestra implementación personalizada (que devuelve valores no normalizados)
+                centrality = my_betweenness_centrality(subgraph)
+
+                # 2. Normalizamos los resultados de 0 a 1 para una visualización consistente
+                max_centrality = max(centrality.values()) if centrality else 0
+                if max_centrality > 0:
+                    normalized_centrality = {node: value / max_centrality for node, value in centrality.items()}
+                else:
+                    normalized_centrality = centrality # Evitar división por cero
+
+                st.session_state.centrality = normalized_centrality
                 st.sidebar.success("Cálculo de centralidad completado.")
         else:
             st.sidebar.warning("No hay nodos en la vista actual para analizar.")
 
 elif analysis_mode == 'Análisis de Vulnerabilidad':
     st.sidebar.info("Haz clic en un nodo del mapa para simular su desconexión.")
+    
+    # El botón de solución solo aparece si hay una falla simulada y no se ha calculado una solución aún.
+    if st.session_state.failed_nodes and not st.session_state.solution_calculated:
+        if st.sidebar.button("💡 Buscar Solución"):
+            isolated_nodes = list(st.session_state.isolated_nodes)
+            healthy_nodes = set(subgraph.nodes()) - st.session_state.failed_nodes - st.session_state.isolated_nodes
+
+            # Llamada a nuestra nueva función de orquestación que usa my_kmeans
+            suggested_connections, re_energized_edges = find_contingency_solution(
+                subgraph,
+                nodes_df,
+                isolated_nodes,
+                healthy_nodes
+            )
+            st.session_state.suggested_connections = suggested_connections
+            st.session_state.re_energized_edges = re_energized_edges
+            
+            st.session_state.solution_calculated = True
+            st.rerun()
+
     if st.sidebar.button("Resetear Simulación"):
         reset_analysis_states()
         st.rerun() # Forzar la recarga de la app
@@ -208,13 +246,20 @@ if not filtered_nodes_df.empty:
             edge_weight = 1.5
             edge_opacity = 0.7
 
-            # Resaltar la ruta óptima si está calculada
-            if st.session_state.shortest_path:
+            is_re_energized = (u, v) in st.session_state.re_energized_edges or (v, u) in st.session_state.re_energized_edges
+
+            if st.session_state.solution_calculated and is_re_energized:
+                edge_color = "#87CEEB"  # Celeste / Sky Blue
+                edge_weight = 2.5
+                edge_opacity = 0.9
+            elif st.session_state.shortest_path:
+                # Resaltar la ruta óptima si está calculada
                 path_edges = list(zip(st.session_state.shortest_path, st.session_state.shortest_path[1:]))
                 if (u, v) in path_edges or (v, u) in path_edges:
                     edge_color = PRIMARY_COLOR # Azul brillante
                     edge_weight = 4
                     edge_opacity = 1.0
+
 
             pos_u = graph.nodes[u]['pos']
             pos_v = graph.nodes[v]['pos']
@@ -271,10 +316,10 @@ if not filtered_nodes_df.empty:
         elif analysis_mode == 'Análisis de Centralidad' and st.session_state.centrality:
             centrality_value = st.session_state.centrality.get(node['COD'], 0)
             # Escalar el radio y el color basado en la centralidad.
-            # Los nodos más críticos se visualizan más grandes y de color más intenso (rojo).
-            node_radius = 3 + centrality_value * 50  # Escala el radio
+            # Los nodos más críticos se visualizan más grandes y de color más intenso (rojo). Ajustado para valores normalizados (0-1).
+            node_radius = 4 + centrality_value * 15  # Escala el radio
             # Interpola el color de verde a rojo basado en la centralidad.
-            if centrality_value > 0.01: # Umbral para destacar
+            if centrality_value > 0.1: # Umbral para destacar (ajustado para normalización 0-1)
                 red_component = int(min(255, 255 * centrality_value * 20))
                 green_component = int(max(0, 255 - (255 * centrality_value * 10)))
                 node_color = f'#{red_component:02x}{green_component:02x}00'
@@ -285,9 +330,14 @@ if not filtered_nodes_df.empty:
                 # El nodo fallido se dibuja con un ícono especial y se omite el dibujo normal.
                 pass
             elif node['COD'] in st.session_state.isolated_nodes:
-                # Nodos aislados se muestran en gris.
-                node_color = GRAY_COLOR
-                icon_color = 'lightgray'
+                if st.session_state.solution_calculated:
+                    # Nodo ahora considerado "restaurado"
+                    node_color = PRIMARY_COLOR
+                    icon_color = 'blue'
+                else:
+                    # Nodo aislado, sin solución aún
+                    node_color = GRAY_COLOR
+                    icon_color = 'lightgray'
 
         # --- Lógica de Dibujo en el Mapa ---
         if is_failed_node:
@@ -317,6 +367,22 @@ if not filtered_nodes_df.empty:
                     tooltip=tooltip_html # El tooltip se muestra al pasar el cursor por el icono
                 ).add_to(m)
 
+    # Dibujar conexiones de contingencia sugeridas
+    if analysis_mode == 'Análisis de Vulnerabilidad' and st.session_state.suggested_connections:
+        for u, v in st.session_state.suggested_connections:
+            if u in graph.nodes and v in graph.nodes:
+                pos_u = graph.nodes[u]['pos']
+                pos_v = graph.nodes[v]['pos']
+                folium.PolyLine(
+                    locations=[(pos_u[1], pos_u[0]), (pos_v[1], pos_v[0])],
+                    color='#00FFFF',  # Cian brillante para destacar
+                    weight=3,
+                    opacity=0.9,
+                    dash_array='10, 5', # Línea punteada
+                    tooltip=f"CONEXIÓN DE CONTINGENCIA: {u} a {v}"
+                ).add_to(m)
+
+
 # --- 6. MOSTRAR EL MAPA EN STREAMLIT ---
 map_output = st_folium(m, width='100%', height=600, returned_objects=['last_clicked'])
 
@@ -334,6 +400,8 @@ with col1:
         <li><span style='background-color:{GRAY_COLOR}; border-radius:50%; display: inline-block; width: 12px; height: 12px; margin-right: 5px;'></span> Nodo Aislado</li>
         <li><i class='fa fa-times-circle' style='color:black; margin-left: -2px; margin-right: 5px;'></i> Falla Simulada</li>
         <hr style='margin: 5px 0;'>
+        <li><div style='border-bottom: 4px dashed #00FFFF; width: 20px; display: inline-block; vertical-align: middle; margin-right: 5px;'></div> Conexión de Contingencia</li>
+        <li><div style='background-color:#87CEEB; height: 4px; width: 20px; display: inline-block; vertical-align: middle; margin-right: 5px;'></div> Línea Re-energizada</li>
         <li><div style='background-color:{PRIMARY_COLOR}; height: 4px; width: 20px; display: inline-block; vertical-align: middle; margin-right: 5px;'></div> Línea de Ruta Óptima</li>
     </ul>
     """
@@ -344,11 +412,19 @@ with col2:
     if analysis_mode == 'Análisis de Centralidad' and st.session_state.centrality:
         st.info("Los nodos más grandes y rojizos son los más críticos en la red. Su falla tendría un impacto significativo en la conectividad.")
     elif analysis_mode == 'Análisis de Vulnerabilidad' and st.session_state.failed_nodes:
-        st.warning(f"""
-        **Simulación Activa:**
-        - **Nodos con Fallo:** {len(st.session_state.failed_nodes)}
-        - **Nodos Aislados:** {len(st.session_state.isolated_nodes)}
-        """)
+        info_message = (
+            f"**Simulación Activa:**\n\n"
+            f"- **Nodos con Fallo:** {len(st.session_state.failed_nodes)}\n"
+            f"- **Nodos Aislados:** {len(st.session_state.isolated_nodes)}"
+        )
+        if st.session_state.solution_calculated:
+            info_message += "\n\n---\n\n**Solución Propuesta:**\n\n"
+            info_message += (f"Se sugieren **{len(st.session_state.suggested_connections)}** nueva(s) conexión(es) "
+                             f"para re-energizar {len(st.session_state.re_energized_edges)} líneas internas.")
+            st.success(info_message)
+        elif st.session_state.failed_nodes:
+            info_message += "\n\n*Presione 'Buscar Solución' para calcular una contingencia.*"
+            st.warning(info_message)
     elif analysis_mode == 'Análisis de Ruta Óptima' and st.session_state.shortest_path:
         st.success(f"Mostrando ruta óptima entre **{st.session_state.start_node}** y **{st.session_state.end_node}**.")
     else:
@@ -365,60 +441,52 @@ with st.expander("📖 Ver Tabla de Datos de Nodos Filtrados"):
     st.dataframe(display_df, use_container_width=True)
 
 # --- 8. LÓGICA POST-RENDERIZADO PARA CLICS EN EL MAPA ---
-if analysis_mode == 'Análisis de Vulnerabilidad':
-    if map_output and map_output.get("last_clicked"):
-        clicked_coords = map_output["last_clicked"]
-        lat, lon = clicked_coords['lat'], clicked_coords['lng']
+if analysis_mode == 'Análisis de Vulnerabilidad' and map_output and map_output.get("last_clicked"):
+    clicked_coords = map_output["last_clicked"]
+    current_click_key = f"{clicked_coords['lat']},{clicked_coords['lng']}"
 
-        # Crear una clave única para el clic actual para evitar reprocesamiento
-        current_click_key = f"{lat},{lon}"
+    # Solo se procesa si es un clic nuevo para evitar reprocesamiento por el rerender de Streamlit.
+    if st.session_state.last_processed_click_coords != current_click_key:
+        st.session_state.last_processed_click_coords = current_click_key
 
-        # Solo se procesa si es un clic nuevo (diferente al último procesado).
-        if st.session_state.last_processed_click_coords != current_click_key:
-            st.session_state.last_processed_click_coords = current_click_key
+        # --- 1. Detectar Clic y Encontrar Nodo (Optimizado) ---
+        if not filtered_nodes_df.empty:
+            # Convertir coordenadas de nodos a un array de NumPy para cálculo vectorizado.
+            node_coords = filtered_nodes_df[['LATITUD', 'LONGITUD']].to_numpy()
+            click_coord = np.array([clicked_coords['lat'], clicked_coords['lng']])
+            
+            # Calcular la distancia de todos los nodos al punto de clic de una sola vez.
+            distances = np.linalg.norm(node_coords - click_coord, axis=1)
+            
+            # Encontrar el índice del nodo más cercano.
+            closest_node_idx = distances.argmin()
+            min_dist = distances[closest_node_idx]
 
-            # Encontrar el nodo del grafo más cercano a las coordenadas del clic.
-            min_dist = float('inf')
-            closest_node_cod = None
+            CLICK_THRESHOLD = 0.02
+            if min_dist < CLICK_THRESHOLD:
+                closest_node = filtered_nodes_df.iloc[closest_node_idx]
+                closest_node_cod = closest_node['COD']
 
-            # Iterar solo sobre los nodos actualmente visibles.
-            if not filtered_nodes_df.empty:
-                for _, node in filtered_nodes_df.iterrows():
-                    # Calcular la distancia euclidiana entre el clic y cada nodo.
-                    node_lat = node['LATITUD']
-                    node_lon = node['LONGITUD']
-                    dist = np.sqrt((node_lat - lat)**2 + (node_lon - lon)**2)
-                    if dist < min_dist:
-                        min_dist = dist
-                        closest_node_cod = node['COD']
-                
-                # Umbral de distancia para considerar un clic válido sobre un nodo.
-                CLICK_THRESHOLD = 0.02 # Reducido para mayor precisión
-                
-                if closest_node_cod and min_dist < CLICK_THRESHOLD:
-                    # Solo se procesa la falla si el nodo no ha fallado previamente.
-                    if closest_node_cod not in st.session_state.failed_nodes:
-                        
-                        # --- Análisis de Impacto Localizado ---
-                        # 1. Identificar el clúster (ciudad) al que pertenece el nodo fallado.
-                        city_id = filtered_nodes_df.loc[filtered_nodes_df['COD'] == closest_node_cod, 'city'].iloc[0]
-                        nodes_in_city = set(filtered_nodes_df[filtered_nodes_df['city'] == city_id]['COD'])
+                # --- 2. Simular Falla y Calcular Nodos Aislados ---
+                if closest_node_cod not in st.session_state.failed_nodes:                    
+                    # Resetear cualquier solución previa antes de simular una nueva falla
+                    st.session_state.solution_calculated = False
+                    st.session_state.suggested_connections = []
+                    st.session_state.re_energized_edges = set()
 
-                        # 2. Añadir el nodo al conjunto global de fallas para su visualización.
-                        st.session_state.failed_nodes.add(closest_node_cod)
-                        
-                        # 3. Crear un subgrafo temporal que contenga solo los nodos del clúster afectado.
-                        city_subgraph = subgraph.subgraph(nodes_in_city).copy()
-                        
-                        # 4. Simular la falla eliminando los nodos correspondientes DENTRO del subgrafo del clúster.
-                        failed_nodes_in_city = st.session_state.failed_nodes.intersection(nodes_in_city)
-                        city_subgraph.remove_nodes_from(failed_nodes_in_city)
+                    st.session_state.failed_nodes.add(closest_node_cod)                    
+                    
+                    # Análisis de impacto localizado por clúster ('city').
+                    city_id = closest_node['city']
+                    nodes_in_city = set(filtered_nodes_df[filtered_nodes_df['city'] == city_id]['COD'])
+                    city_subgraph = subgraph.subgraph(nodes_in_city).copy()
+                    failed_nodes_in_city = st.session_state.failed_nodes.intersection(nodes_in_city)
+                    city_subgraph.remove_nodes_from(failed_nodes_in_city)
 
-                        # 5. Calcular los nodos aislados comparando los componentes restantes con el conjunto original del clúster.
-                        if city_subgraph.number_of_nodes() > 0:
-                            components = list(nx.connected_components(city_subgraph))
+                    if city_subgraph.number_of_nodes() > 0:
+                        components = list(nx.connected_components(city_subgraph))
+                        if components:
                             largest_component = max(components, key=len)
                             newly_isolated = (nodes_in_city - largest_component) - failed_nodes_in_city
                             st.session_state.isolated_nodes.update(newly_isolated)
-
-                        st.rerun()
+                    st.rerun()
